@@ -13,29 +13,85 @@
 </head>
 <body>
 <h3>VP8 keyframe request test</h3>
-<p>Self-call on this device using VP8. Every 5 seconds it asks the encoder for a keyframe
-(the same request a PLI from the other side triggers) and counts how many keyframes the encoder actually produces.</p>
+<p>Self-call on this device using VP8. Every 5 seconds the receiving side asks the sender for a keyframe
+(a PLI, the same request the other side of a real call sends) and the page counts how many keyframes the encoder actually produces.</p>
+<details open>
+<summary><b>How to run it</b></summary>
+<ol>
+  <li>Tap <b>Start</b> and allow the camera.</li>
+  <li>Stay on this page for about 30 seconds (switching tabs or apps pauses the camera), then screenshot the text below the videos.</li>
+  <li>To compare against the software encoder (Chrome on Android or desktop): open <code>chrome://flags</code>,
+    set <b>Hardware-accelerated video encode</b> to <b>Disabled</b>, relaunch Chrome, and run the test again.
+    The encoder line should then say <code>libvpx</code>. Set the flag back to <b>Default</b> afterwards.</li>
+</ol>
+<b>How to read the result</b>
+<ul>
+  <li><b>encoder</b>: the encoder Chrome picked. <code>NdkVideoEncodeAccelerator(…)</code> is the phone's hardware encoder, <code>libvpx</code> is software.</li>
+  <li><b>PLIs received by sender</b>: keyframe requests that reached the sender. It should go up by about one every 5 seconds.</li>
+  <li><b>requests answered</b>: keyframes the encoder produced in response. A healthy encoder keeps up with the requests sent, give or take one.</li>
+  <li>How the video looks doesn't tell you anything here. A self-call loses nothing, so missing keyframes never show on screen.</li>
+  <li>On iOS the encoder name isn't reported and there's no hardware flag to switch, so only the counts are useful there.</li>
+</ul>
+</details>
 <p id="warn" style="color: #b00; font-weight: bold;"></p>
 <button id="start">Start</button> <button id="stop" disabled>Stop</button>
 <div><video id="local" autoplay playsinline muted></video> <video id="remote" autoplay playsinline muted></video></div>
 <pre id="out"></pre>
 <script>
 const REQUEST_INTERVAL_MS = 5000;
+const MAX_ERRORS_SHOWN = 5;
 const out = document.getElementById('out');
 const startBtn = document.getElementById('start');
 const stopBtn = document.getElementById('stop');
-let pc1, pc2, stream, requestTimer, statsTimer;
+let pc1, pc2, stream, worker, requestTimer, statsTimer;
 let requests = 0;
 let startedAt = 0;
 const errors = [];
 
-// The keyframe request (setParameters encodingOptions) is a Chrome feature; other engines,
-// including every browser on iOS, can ignore it silently, which makes the counts meaningless
+// Preferred: a receiver-side encoded transform sends a real PLI to the sender (Chrome and Safari).
+// Fallback: ask the sender's encoder directly through setParameters, which only Chrome implements.
+const usePli = 'RTCRtpScriptTransform' in window;
 const isChromium = !!navigator.userAgentData?.brands?.some((b) => b.brand === 'Chromium');
-if (!isChromium) {
+const method = usePli
+  ? 'PLI from the receiver (RTCRtpScriptTransformer.sendKeyFrameRequest)'
+  : 'sender setParameters keyFrame option';
+if (!usePli && !isChromium) {
   document.getElementById('warn').textContent =
-    'This browser is not Chromium-based, so it may ignore the keyframe requests this test makes. ' +
-    'Results here are not meaningful. Use Chrome on Android or desktop.';
+    'This browser supports neither way this test requests keyframes, so the results are not meaningful.';
+}
+
+// Runs in a worker: passes frames through untouched and sends a PLI whenever the page asks
+const WORKER_SOURCE = `
+let transformer;
+onrtctransform = (event) => {
+  transformer = event.transformer;
+  transformer.readable.pipeTo(transformer.writable);
+};
+onmessage = async () => {
+  try {
+    if (!transformer) throw new Error('transform not attached yet');
+    await transformer.sendKeyFrameRequest();
+    postMessage({ ok: true });
+  } catch (err) {
+    postMessage({ ok: false, error: err.name + ': ' + err.message });
+  }
+};`;
+
+function recordError(message) {
+  errors.push(message);
+  if (errors.length > MAX_ERRORS_SHOWN) errors.shift();
+}
+
+async function requestViaSetParameters(sender) {
+  try {
+    const params = sender.getParameters();
+    await sender.setParameters(params, {
+      encodingOptions: params.encodings.map(() => ({ keyFrame: true }))
+    });
+    requests++;
+  } catch (err) {
+    recordError(`keyframe request failed: ${err.name} ${err.message}`);
+  }
 }
 
 async function start() {
@@ -46,11 +102,22 @@ async function start() {
     stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
     document.getElementById('local').srcObject = stream;
 
+    if (usePli) {
+      worker = new Worker(URL.createObjectURL(new Blob([WORKER_SOURCE], { type: 'text/javascript' })));
+      worker.onmessage = ({ data }) => {
+        if (data.ok) requests++;
+        else recordError(`keyframe request failed: ${data.error}`);
+      };
+    }
+
     pc1 = new RTCPeerConnection();
     pc2 = new RTCPeerConnection();
     pc1.onicecandidate = (e) => e.candidate && pc2.addIceCandidate(e.candidate);
     pc2.onicecandidate = (e) => e.candidate && pc1.addIceCandidate(e.candidate);
-    pc2.ontrack = (e) => { document.getElementById('remote').srcObject = new MediaStream([e.track]); };
+    pc2.ontrack = (e) => {
+      if (usePli) e.receiver.transform = new RTCRtpScriptTransform(worker, { side: 'receiver' });
+      document.getElementById('remote').srcObject = new MediaStream([e.track]);
+    };
 
     const transceiver = pc1.addTransceiver(stream.getVideoTracks()[0], { direction: 'sendonly' });
     // Force VP8
@@ -64,37 +131,36 @@ async function start() {
 
     const sender = transceiver.sender;
     startedAt = Date.now();
-    requestTimer = setInterval(async () => {
-      try {
-        const params = sender.getParameters();
-        await sender.setParameters(params, {
-          encodingOptions: params.encodings.map(() => ({ keyFrame: true }))
-        });
-        requests++;
-      } catch (err) {
-        errors.push(`keyframe request failed: ${err.name} ${err.message}`);
-      }
+    requestTimer = setInterval(() => {
+      if (usePli) worker.postMessage('keyframe');
+      else requestViaSetParameters(sender);
     }, REQUEST_INTERVAL_MS);
     statsTimer = setInterval(showStats, 1000);
     stopBtn.disabled = false;
   } catch (err) {
-    errors.push(`start failed: ${err.name} ${err.message}`);
+    recordError(`start failed: ${err.name} ${err.message}`);
     showStats();
     startBtn.disabled = false;
   }
 }
 
 async function showStats() {
-  const lines = [`time: ${Math.round((Date.now() - startedAt) / 1000)} s`, `user agent: ${navigator.userAgent}`, ''];
+  const lines = [
+    `time: ${Math.round((Date.now() - startedAt) / 1000)} s`,
+    `user agent: ${navigator.userAgent}`,
+    `keyframe request method: ${method}`,
+    ''
+  ];
   let keyFramesEncoded = 0;
   if (pc1) {
     (await pc1.getStats()).forEach((s) => {
       if (s.type === 'outbound-rtp' && s.kind === 'video') {
         keyFramesEncoded = s.keyFramesEncoded || 0;
         lines.push(
-          `encoder: ${s.encoderImplementation}`,
+          `encoder: ${s.encoderImplementation ?? '(not reported by this browser)'}`,
           `size: ${s.frameWidth}x${s.frameHeight} @ ${s.framesPerSecond} fps`,
           `frames encoded: ${s.framesEncoded}`,
+          `PLIs received by sender: ${s.pliCount}`,
           `keyframes encoded: ${keyFramesEncoded}`
         );
       }
@@ -103,7 +169,10 @@ async function showStats() {
   if (pc2) {
     (await pc2.getStats()).forEach((s) => {
       if (s.type === 'inbound-rtp' && s.kind === 'video') {
-        lines.push(`decoder: ${s.decoderImplementation}`, `keyframes decoded: ${s.keyFramesDecoded}`);
+        lines.push(
+          `decoder: ${s.decoderImplementation ?? '(not reported by this browser)'}`,
+          `keyframes decoded: ${s.keyFramesDecoded}`
+        );
       }
     });
   }
@@ -120,6 +189,7 @@ async function stop() {
   await showStats();
   pc1?.close();
   pc2?.close();
+  worker?.terminate();
   stream?.getTracks().forEach((t) => t.stop());
   stopBtn.disabled = true;
   startBtn.disabled = false;
