@@ -15,6 +15,7 @@
 <h3>VP8 keyframe request test</h3>
 <p>Self-call on this device using VP8. Every 5 seconds it asks the encoder for a keyframe
 (the same request a PLI from the other side triggers) and counts how many keyframes the encoder actually produces.</p>
+<p id="warn" style="color: #b00; font-weight: bold;"></p>
 <button id="start">Start</button> <button id="stop" disabled>Stop</button>
 <div><video id="local" autoplay playsinline muted></video> <video id="remote" autoplay playsinline muted></video></div>
 <pre id="out"></pre>
@@ -27,6 +28,15 @@ let pc1, pc2, stream, requestTimer, statsTimer;
 let requests = 0;
 let startedAt = 0;
 const errors = [];
+
+// The keyframe request (setParameters encodingOptions) is a Chrome feature; other engines,
+// including every browser on iOS, can ignore it silently, which makes the counts meaningless
+const isChromium = !!navigator.userAgentData?.brands?.some((b) => b.brand === 'Chromium');
+if (!isChromium) {
+  document.getElementById('warn').textContent =
+    'This browser is not Chromium-based, so it may ignore the keyframe requests this test makes. ' +
+    'Results here are not meaningful. Use Chrome on Android or desktop.';
+}
 
 async function start() {
   startBtn.disabled = true;
