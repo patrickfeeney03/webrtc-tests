@@ -1,0 +1,122 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VP8 keyframe request test</title>
+<style>
+  body { font-family: sans-serif; margin: 8px; }
+  video { width: 48%; background: #000; }
+  pre { font-size: 14px; white-space: pre-wrap; }
+  button { font-size: 16px; padding: 6px 14px; }
+</style>
+</head>
+<body>
+<h3>VP8 keyframe request test</h3>
+<p>Self-call on this device using VP8. Every 5 seconds it asks the encoder for a keyframe
+(the same request a PLI from the other side triggers) and counts how many keyframes the encoder actually produces.</p>
+<button id="start">Start</button> <button id="stop" disabled>Stop</button>
+<div><video id="local" autoplay playsinline muted></video> <video id="remote" autoplay playsinline muted></video></div>
+<pre id="out"></pre>
+<script>
+const REQUEST_INTERVAL_MS = 5000;
+const out = document.getElementById('out');
+const startBtn = document.getElementById('start');
+const stopBtn = document.getElementById('stop');
+let pc1, pc2, stream, requestTimer, statsTimer;
+let requests = 0;
+let startedAt = 0;
+const errors = [];
+
+async function start() {
+  startBtn.disabled = true;
+  requests = 0;
+  errors.length = 0;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+    document.getElementById('local').srcObject = stream;
+
+    pc1 = new RTCPeerConnection();
+    pc2 = new RTCPeerConnection();
+    pc1.onicecandidate = (e) => e.candidate && pc2.addIceCandidate(e.candidate);
+    pc2.onicecandidate = (e) => e.candidate && pc1.addIceCandidate(e.candidate);
+    pc2.ontrack = (e) => { document.getElementById('remote').srcObject = new MediaStream([e.track]); };
+
+    const transceiver = pc1.addTransceiver(stream.getVideoTracks()[0], { direction: 'sendonly' });
+    // Force VP8
+    const vp8 = RTCRtpSender.getCapabilities('video').codecs.filter((c) => c.mimeType === 'video/VP8');
+    transceiver.setCodecPreferences(vp8);
+
+    await pc1.setLocalDescription();
+    await pc2.setRemoteDescription(pc1.localDescription);
+    await pc2.setLocalDescription();
+    await pc1.setRemoteDescription(pc2.localDescription);
+
+    const sender = transceiver.sender;
+    startedAt = Date.now();
+    requestTimer = setInterval(async () => {
+      try {
+        const params = sender.getParameters();
+        await sender.setParameters(params, {
+          encodingOptions: params.encodings.map(() => ({ keyFrame: true }))
+        });
+        requests++;
+      } catch (err) {
+        errors.push(`keyframe request failed: ${err.name} ${err.message}`);
+      }
+    }, REQUEST_INTERVAL_MS);
+    statsTimer = setInterval(showStats, 1000);
+    stopBtn.disabled = false;
+  } catch (err) {
+    errors.push(`start failed: ${err.name} ${err.message}`);
+    showStats();
+    startBtn.disabled = false;
+  }
+}
+
+async function showStats() {
+  const lines = [`time: ${Math.round((Date.now() - startedAt) / 1000)} s`, `user agent: ${navigator.userAgent}`, ''];
+  let keyFramesEncoded = 0;
+  if (pc1) {
+    (await pc1.getStats()).forEach((s) => {
+      if (s.type === 'outbound-rtp' && s.kind === 'video') {
+        keyFramesEncoded = s.keyFramesEncoded || 0;
+        lines.push(
+          `encoder: ${s.encoderImplementation}`,
+          `size: ${s.frameWidth}x${s.frameHeight} @ ${s.framesPerSecond} fps`,
+          `frames encoded: ${s.framesEncoded}`,
+          `keyframes encoded: ${keyFramesEncoded}`
+        );
+      }
+    });
+  }
+  if (pc2) {
+    (await pc2.getStats()).forEach((s) => {
+      if (s.type === 'inbound-rtp' && s.kind === 'video') {
+        lines.push(`decoder: ${s.decoderImplementation}`, `keyframes decoded: ${s.keyFramesDecoded}`);
+      }
+    });
+  }
+  // The first keyframe comes from the call starting, not from a request
+  lines.push('', `keyframe requests sent: ${requests}`, `requests answered: ${Math.max(keyFramesEncoded - 1, 0)} of ${requests}`);
+  lines.push('', 'Healthy encoder: "requests answered" keeps up with "requests sent".');
+  if (errors.length) lines.push('', 'Errors:', ...errors);
+  out.textContent = lines.join('\n');
+}
+
+async function stop() {
+  clearInterval(requestTimer);
+  clearInterval(statsTimer);
+  await showStats();
+  pc1?.close();
+  pc2?.close();
+  stream?.getTracks().forEach((t) => t.stop());
+  stopBtn.disabled = true;
+  startBtn.disabled = false;
+}
+
+startBtn.onclick = start;
+stopBtn.onclick = stop;
+</script>
+</body>
+</html>
